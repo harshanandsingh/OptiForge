@@ -160,9 +160,6 @@ def run_ai_coach(compiler_cmd, code_filename, volumes, workdir):
 # -----------------------------------
 #  Compilation API Endpoint
 # -----------------------------------
-# ... (keep imports and helper function the same) ...
-
-# ... (all your imports and helper functions, including the new run_ai_coach) ...
 
 @app.route("/api/compile", methods=['POST'])
 def compile_code():
@@ -194,7 +191,6 @@ def compile_code():
 
         try:
             # --- 1. RUN THE USER'S PRIMARY REQUEST ---
-            # (We run this first so the user gets their main output)
             logging.info(f"Running primary job: {output_type}")
             if output_type == 'run':
                 docker_cmd = f"bash -c '{compiler_cmd} {opt_flag} /io/{code_filename} -o /io/prog && timeout 2s /io/prog < /io/input.txt'"
@@ -247,11 +243,9 @@ def compile_code():
                 main_output = run_docker_container("my-compiler-image", docker_cmd, volumes)
 
             # --- 2. RUN THE AI OPTIMIZATION COACH ---
-            # This runs after the main job, regardless of what it was
             ai_coach_results = run_ai_coach(compiler_cmd, code_filename, volumes, "/io")
 
             # --- 3. RUN COMPARISON (NEW!) ---
-            # We pass the user's selected language and optimization flag
             comparison_results = run_comparison(lang, opt_flag, code_filename, volumes, "/io")
 
             # --- 4. SEND FINAL RESPONSE ---
@@ -270,4 +264,5 @@ def compile_code():
 
 
 if __name__ == "__main__":
+
     app.run(debug=True, port=5000)
