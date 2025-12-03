@@ -161,6 +161,77 @@ def run_ai_coach(compiler_cmd, code_filename, volumes, workdir):
 #  Compilation API Endpoint
 # -----------------------------------
 
+# -----------------------------------
+#  LLVM Pass Analysis Endpoint
+# -----------------------------------
+
+@app.route("/api/llvm-pass", methods=['POST'])
+def apply_llvm_pass():
+    """
+    Applies an LLVM pass to the user's code via opt.
+    Supported passes include: opcode-counter, and other custom passes.
+    """
+    data = request.json
+    code = data.get('code', '')
+    lang = data.get('language', 'c')
+    pass_name = data.get('pass', 'opcode-counter')  # e.g., 'opcode-counter'
+    opt_level = data.get('optimization', '-O0')
+    
+    # Validate pass name (prevent injection attacks)
+    allowed_passes = ['opcode-counter']  # Expand this as you add more passes
+    if pass_name not in allowed_passes:
+        return jsonify({"error": f"Unknown pass: {pass_name}. Allowed passes: {allowed_passes}"}), 400
+    
+    ext = ".c" if lang == 'c' else ".cpp"
+    compiler_cmd = "clang" if lang == 'c' else "clang++"
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        code_filename = f"main{ext}"
+        code_path = os.path.join(temp_dir, code_filename)
+        ir_path = os.path.join(temp_dir, "code.ll")
+        
+        # 1. Write the source code to file
+        with open(code_path, 'w') as f:
+            f.write(code)
+        
+        volumes = {temp_dir: {'bind': '/io', 'mode': 'rw'}}
+        
+        try:
+            # 2. Generate LLVM IR (disable optnone attribute so passes can run)
+            logging.info(f"[LLVM_PASS] Generating LLVM IR with optimization {opt_level}...")
+            cmd_ir = (
+                f"{compiler_cmd} -Xclang -disable-O0-optnone -fno-discard-value-names "
+                f"{opt_level} -S -emit-llvm /io/{code_filename} -o /io/code.ll"
+            )
+            run_docker_container("my-compiler-image", cmd_ir, volumes, "/io")
+            
+            # 3. Apply the LLVM pass
+            logging.info(f"[LLVM_PASS] Applying pass: {pass_name}...")
+            if pass_name == 'opcode-counter':
+                cmd_pass = (
+                    f"opt -load-pass-plugin=/opt/llvm-passes/libOpcodeCounter.so "
+                    f"-passes='function(opcode-counter)' -disable-output /io/code.ll"
+                )
+            else:
+                return jsonify({"error": f"Pass handler not implemented: {pass_name}"}), 500
+            
+            pass_output = run_docker_container("my-compiler-image", cmd_pass, volumes, "/io")
+            
+            # 4. Also return the IR for debugging/inspection
+            with open(ir_path, 'r') as f:
+                ir_content = f.read()
+            
+            return jsonify({
+                "pass_name": pass_name,
+                "pass_output": pass_output,
+                "ir": ir_content
+            })
+        
+        except Exception as e:
+            logging.exception(f"[LLVM_PASS] Error applying pass: {e}")
+            return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/compile", methods=['POST'])
 def compile_code():
     data = request.json
@@ -264,5 +335,4 @@ def compile_code():
 
 
 if __name__ == "__main__":
-
-    app.run(debug=True, port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000)
