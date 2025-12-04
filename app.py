@@ -273,8 +273,8 @@ def apply_llvm_pass():
             logging.info(f"[LLVM_PASS] Applying pass: {pass_name}...")
             if pass_name == 'opcode-counter':
                 cmd_pass = (
-                    f"opt -load-pass-plugin=/opt/llvm-passes/libOpcodeCounter.so "
-                    f"-passes='function(opcode-counter)' -disable-output /io/code.ll"
+                    f"bash -c 'opt -load-pass-plugin=/opt/llvm-passes/libOpcodeCounter.so "
+                    f"-passes=\"function(opcode-counter)\" -disable-output /io/code.ll'"
                 )
             else:
                 return jsonify({"error": f"Pass handler not implemented: {pass_name}"}), 500
