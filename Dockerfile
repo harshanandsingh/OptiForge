@@ -26,7 +26,7 @@ RUN apt-get update && \
     ln -s /usr/bin/llvm-profdata-19 /usr/bin/llvm-profdata || true && \
     ln -s /usr/bin/opt-19 /usr/bin/opt || true
 
-RUN mkdir -p /opt/llvm-passes
-COPY LLVMProject/OpcodeCounter/build/libOpcodeCounter.so /opt/llvm-passes/
+    RUN mkdir -p /opt/llvm-passes
+    COPY LLVMProject/OpcodeCounter/build/libOpcodeCounter.so /opt/llvm-passes/
 
 WORKDIR /app

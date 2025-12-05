@@ -3,11 +3,17 @@ import glob
 import tempfile
 import docker
 import logging
+import subprocess
+import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 # --- NEW IMPORTS FOR GEMINI ---
 from google import genai
-from google.genai.errors import APIError
+# Fix unresolved import
+try:
+    from google.genai.errors import APIError
+except ImportError:
+    logging.warning("google.genai.errors module not found. Ensure it's installed if needed.")
 # ------------------------------
 
 # --- NEW IMPORTS FOR ENV LOADING ---
@@ -30,6 +36,24 @@ client = docker.from_env()
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# --- CONFIGURATION FOR LLVM PIPELINE ---
+# Update this path to point to your compiled .so file
+OPCODE_PASS_PATH = "./LLVMProject/OpcodeCounter/build/OpcodeCounter.so"
+
+# Map user-friendly names to LLVM internal pass names
+# This acts as a whitelist to prevent command injection
+PASS_MAPPING = {
+    "mem2reg": "mem2reg",
+    "instcombine": "instcombine",
+    "dce": "dce",
+    "adce": "adce",
+    "loop-unroll": "loop-unroll",
+    "gvn": "gvn",
+    "simplifycfg": "simplifycfg",
+    "always-inline": "always-inline",
+    "opcode-counter": "opcode-counter"
+}
 
 # -----------------------------------
 #  Helper Function: Safe Docker Runner
@@ -59,6 +83,23 @@ def run_docker_container(image, command, volumes, workdir="/io"):
         return e.stderr.decode("utf-8", errors="ignore")
     except Exception as e:
         raise RuntimeError(f"Docker execution failed: {str(e)}")
+
+
+# -----------------------------------
+# Helper function for running shell commands (from app1.py)
+# -----------------------------------
+def run_command(cmd):
+    """Helper to run shell commands and catch errors."""
+    try:
+        # shell=True is used here for simplicity in calling complex LLVM commands
+        # capture_output=True captures both stdout and stderr
+        result = subprocess.run(
+            cmd, shell=True, check=True, capture_output=True, text=True
+        )
+        return result.stdout, result.stderr
+    except subprocess.CalledProcessError as e:
+        # Return the standard error if the command failed (e.g., compilation error)
+        return None, e.stderr
 
 
 # -----------------------------------
@@ -230,101 +271,226 @@ def run_cfg_generation(compiler_cmd, opt_flag, code_filename, volumes, workdir, 
 # -----------------------------------
 
 @app.route("/api/llvm-pass", methods=['POST'])
-def apply_llvm_pass():
+def llvm_pass():
     """
     Applies an LLVM pass to the user's code via opt.
     Supported passes include: opcode-counter, and other custom passes.
     """
-    data = request.json
-    code = data.get('code', '')
-    lang = data.get('language', 'c')
-    pass_name = data.get('pass', 'opcode-counter')  # e.g., 'opcode-counter'
-    opt_level = data.get('optimization', '-O0')
-    
-    # Validate pass name (prevent injection attacks)
-    allowed_passes = ['opcode-counter']  # Expand this as you add more passes
-    if pass_name not in allowed_passes:
-        return jsonify({"error": f"Unknown pass: {pass_name}. Allowed passes: {allowed_passes}"}), 400
-    
-    ext = ".c" if lang == 'c' else ".cpp"
-    compiler_cmd = "clang" if lang == 'c' else "clang++"
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        code_filename = f"main{ext}"
-        code_path = os.path.join(temp_dir, code_filename)
-        ir_path = os.path.join(temp_dir, "code.ll")
+    try:
+        data = request.json
+        logging.info(f"[LLVM_PASS] Received request data: {data}")
         
-        # 1. Write the source code to file
-        with open(code_path, 'w') as f:
-            f.write(code)
+        # Extract parameters from request
+        code = data.get('code', '')
+        pass_name = data.get('pass_name')
+        language = data.get('language', 'cpp')
+        opt_level = data.get('optimization', '-O0')
         
-        volumes = {temp_dir: {'bind': '/io', 'mode': 'rw'}}
+        logging.info(f"[LLVM_PASS] pass_name: '{pass_name}', Available passes: {list(PASS_MAPPING.keys())}")
+
+        if not pass_name:
+            return jsonify({"error": "Missing pass_name parameter"}), 400
         
-        try:
-            # 2. Generate LLVM IR (disable optnone attribute so passes can run)
+        if pass_name not in PASS_MAPPING:
+            return jsonify({"error": f"Invalid pass_name '{pass_name}'. Available passes: {list(PASS_MAPPING.keys())}"}), 400
+
+        if not code:
+            return jsonify({"error": "Missing code parameter"}), 400
+
+        # Create temporary directory and files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Determine file extension
+            ext = ".cpp" if language == "cpp" else ".c"
+            src_file = os.path.join(temp_dir, f"code{ext}")
+            ir_file = os.path.join(temp_dir, "code.ll")
+            
+            # Write source code to file
+            with open(src_file, 'w') as f:
+                f.write(code)
+            
+            # Set up Docker volumes
+            volumes = {temp_dir: {'bind': '/io', 'mode': 'rw'}}
+            
+            # Generate LLVM IR
             logging.info(f"[LLVM_PASS] Generating LLVM IR with optimization {opt_level}...")
+            compiler_cmd = "clang++" if language == "cpp" else "clang"
             cmd_ir = (
                 f"{compiler_cmd} -Xclang -disable-O0-optnone -fno-discard-value-names "
-                f"{opt_level} -S -emit-llvm /io/{code_filename} -o /io/code.ll"
+                f"{opt_level} -S -emit-llvm /io/code{ext} -o /io/code.ll"
             )
-            run_docker_container("my-compiler-image", cmd_ir, volumes, "/io")
+            ir_output = run_docker_container("my-compiler-image", cmd_ir, volumes, "/io")
             
-            # 3. Apply the LLVM pass
+            # Check if IR file was created
+            if not os.path.exists(ir_file):
+                return jsonify({"error": f"Failed to generate LLVM IR: {ir_output}"}), 500
+
+            # Apply the LLVM pass
             logging.info(f"[LLVM_PASS] Applying pass: {pass_name}...")
-            if pass_name == 'opcode-counter':
+            if pass_name == "opcode-counter":
                 cmd_pass = (
                     f"bash -c 'opt -load-pass-plugin=/opt/llvm-passes/libOpcodeCounter.so "
-                    f"-passes=\"function(opcode-counter)\" -disable-output /io/code.ll'"
+                    f"-passes=\"{PASS_MAPPING[pass_name]}\" -disable-output /io/code.ll'"
                 )
             else:
-                return jsonify({"error": f"Pass handler not implemented: {pass_name}"}), 500
-            
+                cmd_pass = (
+                    f"bash -c 'opt -passes=\"{PASS_MAPPING[pass_name]}\" -disable-output /io/code.ll'"
+                )
+
             pass_output = run_docker_container("my-compiler-image", cmd_pass, volumes, "/io")
-            
-            # 4. Also return the IR for debugging/inspection
-            with open(ir_path, 'r') as f:
+
+            # Read the IR for debugging/inspection
+            with open(ir_file, 'r') as f:
                 ir_content = f.read()
-            
+
             return jsonify({
                 "pass_name": pass_name,
                 "pass_output": pass_output,
-                "ir": ir_content
+                "ir": ir_content,
+                "status": "success"
             })
-        
-        except Exception as e:
-            logging.exception(f"[LLVM_PASS] Error applying pass: {e}")
-            return jsonify({"error": str(e)}), 500
+
+    except Exception as e:
+        logging.exception(f"[LLVM_PASS] Error applying pass: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/compile", methods=['POST'])
 def compile_code():
+    """Unified compilation endpoint combining Docker and direct LLVM approaches"""
     data = request.json
+    
+    # Extract parameters for both approaches
     code = data.get('code', '')
     user_input = data.get('input', '')
-    
     lang = data.get('language', 'cpp')
     compiler = data.get('compiler', 'llvm')
     opt_flag = data.get('optimization', '-O0')
     output_type = data.get('output_type', 'asm')
-
+    
+    # Direct LLVM parameters
+    user_passes = data.get("passes", [])  # e.g. ["mem2reg", "dce"]
+    outputs_requested = data.get("outputs", [])  # e.g. ["ir", "arm", "opcode_count"]
+    use_direct_llvm = data.get("use_direct_llvm", False)  # Flag to choose compilation mode
+    
+    # Normalize language parameter
+    if lang == 'cpp':
+        lang = 'c++'
+    
     ext = ".c" if lang == 'c' else ".cpp"
     compiler_cmd = "clang" if lang == 'c' else "clang++"
     if compiler == 'gcc':
         compiler_cmd = "gcc" if lang == 'c' else "g++"
 
+    # --- DIRECT LLVM MODE ---
+    if use_direct_llvm or outputs_requested:
+        # Generate a unique ID for this request to avoid file collisions
+        req_id = str(uuid.uuid4())[:8]
+        base_name = f"temp_{req_id}"
+        
+        # Determine file extension and compiler driver for LLVM 19
+        if lang == "c++":
+            src_file = f"{base_name}.cpp"
+            compiler_driver = "clang++-19"
+        else:
+            src_file = f"{base_name}.c"
+            compiler_driver = "clang-19"
+        
+        # Save Source Code to Disk
+        with open(src_file, "w") as f:
+            f.write(code)
+        
+        response = {"status": "success", "errors": "", "mode": "direct_llvm"}
+        
+        try:
+            # --- STAGE 1: COMPILE TO BASE IR ---
+            base_ir_file = f"{base_name}.ll"
+            cmd_compile = f"{compiler_driver} -S -emit-llvm {src_file} -o {base_ir_file} -O0 -Xclang -disable-O0-optnone"
+            
+            _, err = run_command(cmd_compile)
+            if err and "error" in err.lower():
+                raise Exception(f"Compilation Error:\n{err}")
+            
+            # --- STAGE 2: APPLY PASSES (OPTIMIZATION) ---
+            optimized_ir_file = f"{base_name}_opt.ll"
+            
+            if compiler == "llvm":
+                if not user_passes:
+                    run_command(f"cp {base_ir_file} {optimized_ir_file}")
+                else:
+                    valid_passes = [PASS_MAPPING[p] for p in user_passes if p in PASS_MAPPING]
+                    if valid_passes:
+                        pass_args = ",".join(valid_passes)
+                        cmd_opt = f"opt-19 -S -passes='{pass_args}' {base_ir_file} -o {optimized_ir_file}"
+                        _, err = run_command(cmd_opt)
+                        if err and "error" in err.lower():
+                            raise Exception(f"Optimization Error:\n{err}")
+                    else:
+                        run_command(f"cp {base_ir_file} {optimized_ir_file}")
+            else:
+                response["warnings"] = "Custom LLVM passes are not supported when 'GCC' is selected. Returning raw IR."
+                run_command(f"cp {base_ir_file} {optimized_ir_file}")
+            
+            # --- STAGE 3: GENERATE OUTPUTS ---
+            if "ir" in outputs_requested:
+                if os.path.exists(optimized_ir_file):
+                    with open(optimized_ir_file, "r") as f:
+                        response["ir"] = f.read()
+            
+            if "arm" in outputs_requested:
+                asm_file = f"{base_name}.s"
+                cmd_asm = f"llc-19 -march=aarch64 -filetype=asm {optimized_ir_file} -o {asm_file}"
+                _, err = run_command(cmd_asm)
+                if os.path.exists(asm_file):
+                    with open(asm_file, "r") as f:
+                        response["arm"] = f.read()
+                else:
+                    response["arm"] = f"Error generating ASM: {err}"
+            
+            if "opcode_count" in outputs_requested:
+                cmd_count = f"opt-19 -load-pass-plugin={OPCODE_PASS_PATH} -passes=\"opcode-counter\" -disable-output {optimized_ir_file}"
+                _, stderr = run_command(cmd_count)
+                response["opcode_count"] = stderr
+            
+            # Add traditional output if requested
+            if output_type == 'ir' and "ir" not in outputs_requested:
+                response["output"] = response.get("ir", "")
+            elif output_type == 'asm' and "arm" not in outputs_requested:
+                response["output"] = response.get("arm", "")
+            
+        except Exception as e:
+            response["status"] = "error"
+            response["errors"] = str(e)
+        
+        finally:
+            # Cleanup temporary files
+            for ext_clean in [".c", ".cpp", ".ll", "_opt.ll", ".s"]:
+                f = f"{base_name}{ext_clean}"
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
+        
+        return jsonify(response)
+    
+    # --- DOCKER MODE (Original comprehensive analysis) ---
     with tempfile.TemporaryDirectory() as temp_dir:
         code_filename = f"main{ext}"
-        with open(os.path.join(temp_dir, code_filename), 'w') as f: f.write(code)
-        with open(os.path.join(temp_dir, 'input.txt'), 'w') as f: f.write(user_input)
+        with open(os.path.join(temp_dir, code_filename), 'w') as f: 
+            f.write(code)
+        with open(os.path.join(temp_dir, 'input.txt'), 'w') as f: 
+            f.write(user_input)
 
-        volumes = { temp_dir: {'bind': '/io', 'mode': 'rw'} }
+        volumes = {temp_dir: {'bind': '/io', 'mode': 'rw'}}
 
-        # --- Create containers for our final JSON response ---
+        # Response containers
         main_output = ""
         ai_coach_results = {}
         comparison_results = {}
-        cfg_output = "" # NEW: Variable for CFG output
-        top_level_error = None # ADDED: New variable to hold the error text
+        cfg_output = ""
+        top_level_error = None
+        
+        response = {"mode": "docker"}
 
         try:
             # --- 1. RUN THE USER'S PRIMARY REQUEST ---
@@ -332,64 +498,54 @@ def compile_code():
             if output_type == 'run':
                 docker_cmd = f"bash -c '{compiler_cmd} {opt_flag} /io/{code_filename} -o /io/prog && timeout 2s /io/prog < /io/input.txt'"
                 main_output = run_docker_container("my-compiler-image", docker_cmd, volumes)
-            
-            # MODIFIED: Wrap command in 'bash -c' for reliable stdout capture
-            else: # 'asm' or 'ir' (and 'Errors' which maps to 'asm')
+            else:
                 flag = "-S" if output_type == 'asm' else "-S -emit-llvm"
-                if compiler == 'gcc' and output_type == 'ir': flag = "-S"
+                if compiler == 'gcc' and output_type == 'ir': 
+                    flag = "-S"
                 
                 raw_cmd = f"{compiler_cmd} {flag} {opt_flag} /io/{code_filename} -o -"
-                docker_cmd = f"bash -c '{raw_cmd}'" 
-                
+                docker_cmd = f"bash -c '{raw_cmd}'"
                 main_output = run_docker_container("my-compiler-image", docker_cmd, volumes)
 
-            # --- NEW FIX: Detect compilation failure from the main_output (stderr) ---
-            # If the compiler output contains an error, we treat it as a failure 
-            # and short-circuit the rest of the analysis jobs, returning the error immediately.
-            # Check for common compiler error/fatal error messages
+            # Check for compilation errors
             if "error:" in main_output.lower() or "fatal error:" in main_output.lower():
-                
                 top_level_error = main_output
-                logging.error(f"Compilation failed, short-circuiting: {main_output.splitlines()[0]}")
+                logging.error(f"Compilation failed: {main_output.splitlines()[0]}")
                 
-                # Immediately return the error response (still 200 OK, but with error payload)
                 return jsonify({
-                    "output": "",  # Clear the output field
+                    "output": "",
                     "ai_coach": {"recommendation": "Compilation failed, analysis skipped.", "metrics": []},
                     "comparison": {"recommendation": "Compilation failed, comparison skipped.", "metrics": {}},
                     "cfg_output": "Compilation failed, CFG generation skipped.",
-                    "error": top_level_error # Send the compiler error message in the 'error' field
+                    "error": top_level_error,
+                    "mode": "docker"
                 })
-            # --------------------------------------------------------------------------
 
-            # --- 2. RUN THE AI OPTIMIZATION COACH (Unconditional) ---
+            # --- 2. RUN COMPREHENSIVE ANALYSIS ---
             ai_coach_results = run_ai_coach(compiler_cmd, code_filename, volumes, "/io")
-
-            # --- 3. RUN COMPARISON METRICS AND DISPLAY ASSEMBLY (Unconditional) ---
             comparison_results = run_comparison(lang, opt_flag, code_filename, volumes, "/io")
-
-            # DEFERRED: Fix 6 logic is skipped here as per user request to defer
-            comparison_results['llvm_asm'] = "Fix Deferred: The actual LLVM assembly code will be here after Fix 6 is applied." 
+            
+            # Add assembly outputs to comparison
+            comparison_results['llvm_asm'] = "Fix Deferred: The actual LLVM assembly code will be here after Fix 6 is applied."
             comparison_results['gcc_asm'] = "Fix Deferred: The actual GCC assembly code will be here after Fix 6 is applied."
-
-            # --- 4. RUN CFG GENERATION (Unconditional) ---
+            
             cfg_output = run_cfg_generation(compiler_cmd, opt_flag, code_filename, volumes, "/io", temp_dir)
             
-            # --- 5. SEND FINAL RESPONSE ---
             return jsonify({
                 "output": main_output,
                 "ai_coach": ai_coach_results,
                 "comparison": comparison_results,
-                "cfg_output": cfg_output, # NEW: Include CFG output
-                "error": top_level_error # Should be None on success
+                "cfg_output": cfg_output,
+                "error": top_level_error,
+                "mode": "docker"
             })
 
         except RuntimeError as e:
             logging.error(str(e))
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": str(e), "mode": "docker"}), 500
         except Exception as e:
             logging.exception("Unhandled error")
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": str(e), "mode": "docker"}), 500
 
 
 # -----------------------------------
@@ -458,9 +614,10 @@ def gemini_explain():
         # Catch and return the explicit errors raised by the helper function
         return jsonify({"error": str(e)}), 500
     except Exception:
-        return jsonify({"error": "Internal server error"}), 500
+            return jsonify({"error": "Internal server error"}), 500
+
 
 
 if __name__ == "__main__":
 
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, use_reloader=True)
